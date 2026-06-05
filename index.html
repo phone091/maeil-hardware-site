@@ -1392,7 +1392,7 @@ window.MAEIL_SUPABASE = {
 const storageKey = "maeil-hardware-manager-v1";
 const cloudConfig = window.MAEIL_SUPABASE || {};
 
-let supabaseClient = null;
+let cloudSession = null;
 let cloudUser = null;
 let cloudSaveTimer = null;
 let cloudReady = false;
@@ -1464,7 +1464,7 @@ const titles = {
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
-const $ = (selector, root = document) => [...root.querySelectorAll(selector)];
+const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 function loadState() {
   const raw = localStorage.getItem(storageKey);
@@ -1500,6 +1500,73 @@ function hideAuthScreen() {
   $("#authMessage").textContent = "";
 }
 
+const cloudSessionKey = `${storageKey}:cloud-session`;
+
+function cloudBaseUrl(path) {
+  return `${cloudConfig.url.replace(/\/$/, "")}${path}`;
+}
+
+function cloudHeaders(extra = {}) {
+  const headers = {
+    apikey: cloudConfig.anonKey,
+    "Content-Type": "application/json",
+    ...extra,
+  };
+  if (cloudSession?.access_token) {
+    headers.Authorization = `Bearer ${cloudSession.access_token}`;
+  }
+  return headers;
+}
+
+async function cloudRequest(path, options = {}) {
+  const response = await fetch(cloudBaseUrl(path), {
+    ...options,
+    headers: cloudHeaders(options.headers),
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    throw new Error(data?.msg || data?.message || "cloud request failed");
+  }
+  return data;
+}
+
+async function cloudAuth(path, body) {
+  return cloudRequest(path, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+function storeCloudSession(session) {
+  cloudSession = session;
+  cloudUser = session?.user || null;
+  if (session) {
+    localStorage.setItem(cloudSessionKey, JSON.stringify(session));
+  } else {
+    localStorage.removeItem(cloudSessionKey);
+  }
+}
+
+async function restoreCloudSession() {
+  const raw = localStorage.getItem(cloudSessionKey);
+  if (!raw) return false;
+  try {
+    const session = JSON.parse(raw);
+    storeCloudSession(session);
+    if (session.refresh_token) {
+      const refreshed = await cloudAuth("/auth/v1/token?grant_type=refresh_token", {
+        refresh_token: session.refresh_token,
+      });
+      storeCloudSession(refreshed);
+    }
+    return Boolean(cloudUser);
+  } catch {
+    storeCloudSession(null);
+    return false;
+  }
+}
+
 async function initCloud() {
   if (!isCloudConfigured()) {
     setCloudStatus("로컬 저장");
@@ -1508,13 +1575,8 @@ async function initCloud() {
 
   setCloudStatus("클라우드 연결 중");
   try {
-    const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm");
-    supabaseClient = createClient(cloudConfig.url, cloudConfig.anonKey);
     cloudReady = true;
-
-    const { data } = await supabaseClient.auth.getSession();
-    if (data.session?.user) {
-      cloudUser = data.session.user;
+    if (await restoreCloudSession()) {
       await loadCloudState();
       hideAuthScreen();
       $("#logoutButton")?.classList.remove("is-hidden");
@@ -1531,27 +1593,23 @@ async function initCloud() {
 }
 
 async function loadCloudState() {
-  if (!supabaseClient || !cloudUser) return;
-  const { data, error } = await supabaseClient
-    .from("app_state")
-    .select("data")
-    .eq("user_id", cloudUser.id)
-    .maybeSingle();
-
-  if (error) {
+  if (!cloudSession || !cloudUser) return;
+  try {
+    const rows = await cloudRequest(`/rest/v1/app_state?user_id=eq.${cloudUser.id}&select=data&limit=1`);
+    const data = rows?.[0];
+    if (data?.data) {
+      applyingRemoteState = true;
+      state = { ...structuredClone(seed), ...data.data };
+      localStorage.setItem(storageKey, JSON.stringify(state));
+      applyingRemoteState = false;
+      hydrateForms();
+      renderAll();
+    } else {
+      await saveCloudStateNow();
+    }
+  } catch {
     showToast("클라우드 데이터를 불러오지 못했습니다.");
-    return;
-  }
-
-  if (data?.data) {
-    applyingRemoteState = true;
-    state = { ...structuredClone(seed), ...data.data };
-    localStorage.setItem(storageKey, JSON.stringify(state));
     applyingRemoteState = false;
-    hydrateForms();
-    renderAll();
-  } else {
-    await saveCloudStateNow();
   }
 }
 
@@ -1564,14 +1622,20 @@ function queueCloudSave() {
 }
 
 async function saveCloudStateNow() {
-  if (!supabaseClient || !cloudUser) return;
-  const { error } = await supabaseClient.from("app_state").upsert({
-    user_id: cloudUser.id,
-    data: state,
-    updated_at: new Date().toISOString(),
-  });
-
-  if (error) {
+  if (!cloudSession || !cloudUser) return;
+  try {
+    await cloudRequest("/rest/v1/app_state", {
+      method: "POST",
+      headers: {
+        Prefer: "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({
+        user_id: cloudUser.id,
+        data: state,
+        updated_at: new Date().toISOString(),
+      }),
+    });
+  } catch {
     setCloudStatus("동기화 실패");
     return;
   }
@@ -1610,7 +1674,7 @@ function optionHtml(selectedId = "") {
 }
 
 function refreshCompanySelects() {
-  $('select[name="company"]').forEach((select) => {
+  $$('select[name="company"]').forEach((select) => {
     const current = select.value || select.dataset.selected || "";
     select.innerHTML = optionHtml(current);
   });
@@ -1773,11 +1837,11 @@ function copyText(text) {
   );
 }
 
-$(".nav-item").forEach((button) => {
+$$(".nav-item").forEach((button) => {
   button.addEventListener("click", () => {
     const view = button.dataset.view;
-    $(".nav-item").forEach((item) => item.classList.toggle("is-active", item === button));
-    $(".view").forEach((section) => section.classList.toggle("is-active", section.id === view));
+    $$(".nav-item").forEach((item) => item.classList.toggle("is-active", item === button));
+    $$(".view").forEach((section) => section.classList.toggle("is-active", section.id === view));
     $("#viewTitle").textContent = titles[view][0];
     $("#viewSubtitle").textContent = titles[view][1];
   });
@@ -1936,7 +2000,7 @@ $("#copyTaxSms").addEventListener("click", () => {
 
 $("#printTax").addEventListener("click", () => printSection("printing-tax"));
 
-$("[data-copy]").forEach((button) => {
+$$("[data-copy]").forEach((button) => {
   button.addEventListener("click", () => copyText($(button.dataset.copy).value));
 });
 
@@ -1963,27 +2027,26 @@ $("#importData").addEventListener("change", (event) => {
 
 $("#authForm")?.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!supabaseClient) return;
+  if (!isCloudConfigured()) return;
   const form = event.currentTarget;
   const email = form.email.value.trim();
   const password = form.password.value;
   $("#authMessage").textContent = "로그인 중입니다.";
 
-  const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
-  if (error) {
+  try {
+    const session = await cloudAuth("/auth/v1/token?grant_type=password", { email, password });
+    storeCloudSession(session);
+    await loadCloudState();
+    hideAuthScreen();
+    $("#logoutButton")?.classList.remove("is-hidden");
+    setCloudStatus("클라우드 저장");
+  } catch {
     $("#authMessage").textContent = "로그인 정보를 확인해주세요.";
-    return;
   }
-
-  cloudUser = data.user;
-  await loadCloudState();
-  hideAuthScreen();
-  $("#logoutButton")?.classList.remove("is-hidden");
-  setCloudStatus("클라우드 저장");
 });
 
 $("#signupButton")?.addEventListener("click", async () => {
-  if (!supabaseClient) return;
+  if (!isCloudConfigured()) return;
   const form = $("#authForm");
   const email = form.email.value.trim();
   const password = form.password.value;
@@ -1993,31 +2056,28 @@ $("#signupButton")?.addEventListener("click", async () => {
   }
 
   $("#authMessage").textContent = "계정 생성 중입니다.";
-  const { data, error } = await supabaseClient.auth.signUp({ email, password });
-  if (error) {
-    $("#authMessage").textContent = "계정을 만들지 못했습니다. 이메일/비밀번호를 확인해주세요.";
-    return;
-  }
-
-  cloudUser = data.user;
-  if (cloudUser) {
-    await saveCloudStateNow();
-    hideAuthScreen();
-    $("#logoutButton")?.classList.remove("is-hidden");
-    setCloudStatus("클라우드 저장");
-  } else {
-    $("#authMessage").textContent = "가입 확인 메일을 확인한 뒤 로그인해주세요.";
+  try {
+    const session = await cloudAuth("/auth/v1/signup", { email, password });
+    if (session?.access_token) {
+      storeCloudSession(session);
+      await saveCloudStateNow();
+      hideAuthScreen();
+      $("#logoutButton")?.classList.remove("is-hidden");
+      setCloudStatus("클라우드 저장");
+    } else {
+      $("#authMessage").textContent = "가입 확인 메일을 확인한 뒤 로그인해주세요.";
+    }
+  } catch {
+    $("#authMessage").textContent = "계정을 만들지 못했습니다. 이메일과 비밀번호를 확인해주세요.";
   }
 });
 
 $("#logoutButton")?.addEventListener("click", async () => {
-  if (supabaseClient) await supabaseClient.auth.signOut();
-  cloudUser = null;
+  storeCloudSession(null);
   $("#logoutButton")?.classList.add("is-hidden");
   setCloudStatus("로그인 필요");
   showAuthScreen("로그아웃되었습니다.");
 });
-
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
